@@ -1,0 +1,23 @@
+# Least-privilege AppProject for consumer claims (the "Repo B" security boundary).
+# A user's claims can ONLY create the kro.run claim kinds the platform exposes, in
+# the default namespace — nothing cluster-scoped, no arbitrary resources. Even a
+# malicious/mistaken claim can't break the platform: its power is bounded by the
+# RGD APIs. sourceRepos/repoURL injected at build time (envsubst).
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: solo-claims
+  namespace: argocd
+spec:
+  description: Consumer self-service claims — least-privilege (kro.run in default only)
+  sourceNamespaces:
+    - argocd
+  sourceRepos:
+    - ${CLAIMS_REPO_URL}
+  destinations:
+    - name: in-cluster
+      namespace: default
+  # Only namespaced kro.run claims — NO clusterResourceWhitelist (# cluster-scoped resources)
+  namespaceResourceWhitelist:
+    - group: kro.run
+      kind: '*'

@@ -1,0 +1,63 @@
+version: 0.2
+
+#Managed ArgoCD pulls that artifact directly (repoURL oci://). 
+
+phases:
+  install:
+    commands:
+      # KCL_VERSION (a CodeBuild env var) pins the CLI; the install script reads it.
+      - curl -fsSL https://kcl-lang.io/script/install-cli.sh | bash
+      - export PATH="$HOME/.kcl/bin:$PATH"
+      - kcl version
+      # ORAS — pinned (ORAS_VERSION), same flaky-`latest` lesson as KCL. Packages
+      # the rendered manifests as a single-layer OCI artifact ArgoCD understands.
+      - |
+        V="${ORAS_VERSION#v}"
+        curl -fsSL "https://github.com/oras-project/oras/releases/download/v${V}/oras_${V}_linux_amd64.tar.gz" -o /tmp/oras.tar.gz
+        mkdir -p /tmp/oras && tar -xzf /tmp/oras.tar.gz -C /tmp/oras oras
+        mv /tmp/oras/oras /usr/local/bin/oras
+        oras version
+  pre_build:
+    commands:
+      - export PATH="$HOME/.kcl/bin:$PATH"
+      # ~/.docker/config.json. 
+      - |
+        mkdir -p "$HOME/.docker"
+        TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+        AUTH=$(printf 'AWS:%s' "$TOKEN" | base64 -w0)
+        printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+  build:
+    commands:
+      - export PATH="$HOME/.kcl/bin:$PATH"
+      # publish each platform library package to its own OCI repo, tagged
+      # with the package's own kcl.mod `version` (single source of truth).
+      - |
+        for d in platform/libraries/*/; do
+          lib=$(basename "$d")
+          (cd "$d" && kcl mod push --force "oci://$ECR_REGISTRY/$ECR_NAMESPACE/$lib")
+        done
+      # Inject the APIs' blueprints dependency
+      - |
+        BP_VER=$(awk -F'"' '/^version[[:space:]]*=/{print $2}' platform/libraries/blueprints/kcl.mod)
+        (cd platform/apis && kcl mod add "oci://$ECR_REGISTRY/$ECR_NAMESPACE/blueprints" --tag "$BP_VER")
+      - mkdir -p rendered/layer-1 rendered/apps
+      # platform/apis = the RGDs (pulls blueprints from ECR). 
+      - (cd platform/apis && kcl run -S items -q) > rendered/layer-1/manifests.yaml
+      - |
+        for f in platform/gitops/apps/*.yaml; do
+          envsubst '$MANIFESTS_REPO $MANIFESTS_TAG $CLAIMS_REPO_URL' < "$f" > "rendered/apps/$(basename "$f")"
+        done
+      - echo "rendered:" && wc -l rendered/layer-1/manifests.yaml && ls rendered/apps
+  post_build:
+    commands:
+      # Package rendered/ as ONE tar+gzip layer
+      - |
+        set -e   # fail the build on a bad push (without this, oras errors were silent)
+        tar -czf /tmp/manifests.tar.gz rendered
+        SHA="sha-$(echo "${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}" | cut -c1-7)"
+        MT="application/vnd.oci.image.layer.v1.tar+gzip"
+        # --disable-path-validation: the tarball is an absolute /tmp path (oras
+        # rejects those by default).
+        oras push --disable-path-validation "$MANIFESTS_REPO:$MANIFESTS_TAG" "/tmp/manifests.tar.gz:$MT"
+        oras push --disable-path-validation "$MANIFESTS_REPO:$SHA"           "/tmp/manifests.tar.gz:$MT"
+        echo "pushed $MANIFESTS_REPO tags: $MANIFESTS_TAG, $SHA"

@@ -1,0 +1,31 @@
+# Consumer claims simple request - git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: user-claims
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: solo-claims
+  source:
+    repoURL: ${CLAIMS_REPO_URL}
+    targetRevision: main
+    path: user/claims
+    directory:
+      recurse: true
+  destination:
+    name: in-cluster
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: true          #remove all claims
+    syncOptions:
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        maxDuration: 3m

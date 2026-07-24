@@ -1,0 +1,28 @@
+apiVersion: kro.run/v1alpha1
+kind: VPCNetwork
+metadata:
+  name: my-spoke
+  namespace: default
+spec:
+  name: my-spoke
+  vpcCIDR: '10.0.0.0/16'
+  az1: us-east-1a
+  az2: us-east-1b
+---
+apiVersion: kro.run/v1alpha1
+kind: EKSCluster
+metadata:
+  name: my-spoke
+  namespace: default
+spec:
+  name: my-spoke
+  version: '1.36'
+  networkName: my-spoke
+  amiType: BOTTLEROCKET_x86_64
+  capacityType: ON_DEMAND
+  diskSize: 20
+  instanceTypes:
+  - t3.medium
+  desiredSize: 1
+  minSize: 1
+  maxSize: 3

@@ -1,0 +1,26 @@
+# Layer 1 — KRO ResourceGraphDefinitions. These register the CRDs (VPCNetwork, EKSCluster) 
+# FIRST (sync-wave 0).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: layer-1-rgds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: platform
+  source:
+    # OCI delivery — repoURL + tag injected at build time (envsubst) so the
+    # account-specific registry stays out of git.
+    repoURL: oci://${MANIFESTS_REPO}
+    targetRevision: ${MANIFESTS_TAG}
+    path: rendered/layer-1
+  destination:
+    name: in-cluster
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
