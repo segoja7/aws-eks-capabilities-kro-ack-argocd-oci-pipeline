@@ -10,7 +10,7 @@ spec:
   project: solo-claims
   source:
     repoURL: ${CLAIMS_REPO_URL}
-    targetRevision: main
+    targetRevision: master
     path: user/claims
     directory:
       recurse: true
