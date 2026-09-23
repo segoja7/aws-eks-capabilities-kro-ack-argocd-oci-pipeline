@@ -50,7 +50,7 @@ phases:
           "trustPolicies": [
             {
               "name": "platform-blueprints",
-              "registryScopes": ["*"],
+              "registryScopes": ["$ECR_REGISTRY/$ECR_NAMESPACE/blueprints"],
               "signatureVerification": { "level": "strict" },
               "trustStores": ["signingAuthority:aws-signer-ts"],
               "trustedIdentities": ["$SIGNING_PROFILE_ARN"]
