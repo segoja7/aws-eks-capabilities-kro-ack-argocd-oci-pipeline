@@ -17,6 +17,20 @@ phases:
         mkdir -p /tmp/oras && tar -xzf /tmp/oras.tar.gz -C /tmp/oras oras
         mv /tmp/oras/oras /usr/local/bin/oras
         oras version
+      # Notation + the AWS Signer plugin. The AWS installer bundles both AND
+      # provisions the trust store with AWS Signer's root cert (so verify works
+      # out of the box). Detect deb vs rpm so it runs on Ubuntu or AL CodeBuild images.
+      - |
+        BASE="https://d2hvyiie56hcat.cloudfront.net/linux/amd64/installer"
+        if command -v dpkg >/dev/null 2>&1; then
+          curl -fsSL "$BASE/deb/latest/aws-signer-notation-cli_amd64.deb" -o /tmp/signer-notation.deb
+          dpkg -i -E /tmp/signer-notation.deb
+        else
+          curl -fsSL "$BASE/rpm/latest/aws-signer-notation-cli_amd64.rpm" -o /tmp/signer-notation.rpm
+          rpm -U /tmp/signer-notation.rpm
+        fi
+        notation version
+        notation plugin ls
   pre_build:
     commands:
       - export PATH="$HOME/.kcl/bin:$PATH"
@@ -26,6 +40,26 @@ phases:
         TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
         AUTH=$(printf 'AWS:%s' "$TOKEN" | base64 -w0)
         printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+      # Trust policy for the Frontier-1 gate: accept ONLY signatures from our AWS
+      # Signer profile (SIGNING_PROFILE_ARN), strict level. Commercial region →
+      # aws-signer-ts trust store (provisioned by the installer above).
+      - |
+        cat > /tmp/trust-policy.json <<EOF
+        {
+          "version": "1.0",
+          "trustPolicies": [
+            {
+              "name": "platform-blueprints",
+              "registryScopes": ["*"],
+              "signatureVerification": { "level": "strict" },
+              "trustStores": ["signingAuthority:aws-signer-ts"],
+              "trustedIdentities": ["$SIGNING_PROFILE_ARN"]
+            }
+          ]
+        }
+        EOF
+        notation policy import --force /tmp/trust-policy.json
+        notation policy show
   build:
     commands:
       - export PATH="$HOME/.kcl/bin:$PATH"
@@ -36,9 +70,27 @@ phases:
           lib=$(basename "$d")
           (cd "$d" && kcl mod push --force "oci://$ECR_REGISTRY/$ECR_NAMESPACE/$lib")
         done
-      # Inject the APIs' blueprints dependency
+      # Frontier 1 gate: verify the blueprints library is signed by OUR profile
+      # before rendering. Managed signing signs on push (async) → wait for the
+      # signature, then notation verify. A tampered/unsigned library fails the build.
       - |
+        set -e
         BP_VER=$(awk -F'"' '/^version[[:space:]]*=/{print $2}' platform/libraries/blueprints/kcl.mod)
+        for i in $(seq 1 12); do
+          ST=$(aws ecr describe-image-signing-status \
+                 --repository-name "$ECR_NAMESPACE/blueprints" \
+                 --image-id imageTag="$BP_VER" --region "$AWS_REGION" \
+                 --query 'signingStatuses[0].status' --output text 2>/dev/null || echo PENDING)
+          echo "blueprints signing status: $ST"
+          [ "$ST" = "COMPLETE" ] && break
+          sleep 5
+        done
+        BP_DIGEST=$(aws ecr describe-images \
+                      --repository-name "$ECR_NAMESPACE/blueprints" \
+                      --image-ids imageTag="$BP_VER" --region "$AWS_REGION" \
+                      --query 'imageDetails[0].imageDigest' --output text)
+        notation verify "$ECR_REGISTRY/$ECR_NAMESPACE/blueprints@$BP_DIGEST"
+        # Only after the gate passes: pull the library and render.
         (cd platform/apis && kcl mod add "oci://$ECR_REGISTRY/$ECR_NAMESPACE/blueprints" --tag "$BP_VER")
       - mkdir -p rendered/layer-1 rendered/apps
       # platform/apis = the RGDs (pulls blueprints from ECR). 
