@@ -1,0 +1,99 @@
+# Frontier 2's double-check: ArgoCD doesn't verify OCI signatures on pull
+# (confirmed — argo-cd.readthedocs.io/user-guide/source-integrity-git-gpg/; OCI
+# verification is still an open feature request, argoproj/argo-cd#22609). This
+# PreSync hook closes the gap INSIDE the cluster, right before layer-1-rgds syncs:
+# if `notation verify` fails, this Job fails, and ArgoCD's own documented behavior
+# aborts the whole sync — nothing gets applied (resource_hooks docs).
+#
+# Verifies by DIGEST, not the `dev` tag: reads layer-1-rgds' own
+# .spec.source.targetRevision live, via the RBAC below. By the time this Job
+# runs, platform-root has already updated that field to the new, git-pinned
+# digest — the hook never has to know its own digest from inside itself, it
+# just asks the cluster what was approved.
+#
+# Lives in rendered/layer-1/ (same directory layer-1-rgds.yaml's Application
+# points at) — rendered once per build, bundled INSIDE the artifact it verifies.
+#
+# Credentials: EKS Pod Identity (serviceAccountName below) for AWS, the
+# manifests-verifier Role/RoleBinding (bootstrap stack) for the one Kubernetes
+# read it needs. No static keys either way.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: verify-manifests-signature
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    # A fixed name would collide on the next sync (Jobs are immutable) — delete
+    # the previous run's Job right before creating this one.
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      serviceAccountName: manifests-verifier
+      restartPolicy: Never
+      containers:
+        - name: notation-verify
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          env:
+            - name: AWS_REGION
+              value: "us-east-1"
+            - name: ECR_REGISTRY
+              value: "${ECR_REGISTRY}"
+            - name: MANIFESTS_REPO
+              value: "${MANIFESTS_REPO}"
+            - name: SIGNING_PROFILE_ARN
+              value: "${SIGNING_PROFILE_ARN}"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+              # No `curl` here on purpose: amazonlinux:2023 ships `curl-minimal`
+              # already (full `curl` conflicts with it, dnf refuses to install
+              # both) — curl-minimal's `-fsSL` is all we use below.
+              dnf install -y tar gzip aws-cli >/dev/null
+
+              # Pinned, same convention as everywhere else in this pipeline — no `latest`.
+              curl -fsSL -o /usr/local/bin/kubectl \
+                "https://dl.k8s.io/release/v1.36.0/bin/linux/amd64/kubectl"
+              chmod +x /usr/local/bin/kubectl
+
+              # Same installer CI uses — bundles the AWS Signer root cert as the trust store.
+              BASE="https://d2hvyiie56hcat.cloudfront.net/linux/amd64/installer"
+              curl -fsSL "$BASE/rpm/latest/aws-signer-notation-cli_amd64.rpm" -o /tmp/signer-notation.rpm
+              rpm -U /tmp/signer-notation.rpm
+
+              mkdir -p "$HOME/.docker"
+              TOKEN=$(aws ecr get-login-password --region "$AWS_REGION")
+              AUTH=$(printf 'AWS:%s' "$TOKEN" | base64 -w0)
+              printf '{"auths":{"%s":{"auth":"%s"}}}' "$ECR_REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+
+              cat > /tmp/trust-policy.json <<POLICY
+              {
+                "version": "1.0",
+                "trustPolicies": [
+                  {
+                    "name": "manifests",
+                    "registryScopes": ["$ECR_REGISTRY/$(echo $MANIFESTS_REPO | sed "s|^$ECR_REGISTRY/||")"],
+                    "signatureVerification": { "level": "strict" },
+                    "trustStores": ["signingAuthority:aws-signer-ts"],
+                    "trustedIdentities": ["$SIGNING_PROFILE_ARN"]
+                  }
+                ]
+              }
+              POLICY
+              notation policy import --force /tmp/trust-policy.json
+
+              # In-cluster auth: the pod's own ServiceAccount token, scoped by the
+              # Role/RoleBinding to `get` exactly this one Application.
+              DIGEST=$(kubectl get application layer-1-rgds -n argocd \
+                -o jsonpath='{.spec.source.targetRevision}')
+              echo "layer-1-rgds is pinned to: $DIGEST"
+              case "$DIGEST" in
+                sha256:*) ;;
+                *) echo "refusing to verify a non-digest revision ($DIGEST) — pinning isn't in effect"; exit 1 ;;
+              esac
+
+              echo "Verifying $MANIFESTS_REPO@$DIGEST ..."
+              notation verify "$MANIFESTS_REPO@$DIGEST"

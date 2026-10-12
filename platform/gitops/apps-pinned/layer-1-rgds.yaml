@@ -1,0 +1,30 @@
+# Layer 1 — KRO ResourceGraphDefinitions. These register the CRDs (VPCNetwork, EKSCluster)
+# FIRST (sync-wave 0).
+#
+# This is a TEMPLATE, not the file ArgoCD reads. The committed, resolved file lives at
+# platform/gitops/apps-pinned/layer-1-rgds.yaml and is updated only by the pipeline's
+# promotion step, via a PR — never by hand, never by envsubst into the OCI artifact.
+# Pinning to a digest (not the `dev` tag) is what makes the sync deterministic: ArgoCD
+# applies exactly what was reviewed, regardless of what `dev` currently points to.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: layer-1-rgds
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: platform
+  source:
+    repoURL: oci://700922282251.dkr.ecr.us-east-1.amazonaws.com/kcl-modules/manifests
+    targetRevision: sha256:0cf9b2953c98f925aea8ac38daccda03ab62bcd55907913a8b278bc71ad978c7
+    path: rendered/layer-1
+  destination:
+    name: in-cluster
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

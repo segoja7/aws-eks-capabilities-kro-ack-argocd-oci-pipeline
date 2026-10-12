@@ -9,6 +9,8 @@ spec:
     - argocd
   sourceRepos:
     - oci://${MANIFESTS_REPO}
+    # layer-1-rgds now syncs from here, resolved and digest-pinned (apps-pinned/).
+    - ${PLATFORM_REPO_URL}
   destinations:
     - name: in-cluster
       namespace: '*'

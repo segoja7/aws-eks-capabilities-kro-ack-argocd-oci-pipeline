@@ -86,6 +86,9 @@ rgd = blueprints.ResourcegraphdefinitionBlueprint {
                 spec = {
                     name = r"${schema.spec.name}-cluster-role"
                     assumeRolePolicyDocument = _cluster_assume_role
+                    # Every role ACK creates carries this ceiling — read from the
+                    # same hubConfig ConfigMap the ArgoCD AccessEntry below uses.
+                    permissionsBoundary = r"${hubConfig.data.permissionsBoundaryArn}"
                     policies = [
                         "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
                         "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
@@ -102,6 +105,7 @@ rgd = blueprints.ResourcegraphdefinitionBlueprint {
                 spec = {
                     name = r"${schema.spec.name}-node-role"
                     assumeRolePolicyDocument = _node_assume_role
+                    permissionsBoundary = r"${hubConfig.data.permissionsBoundaryArn}"
                     policies = [
                         "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
                         "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
@@ -112,6 +116,9 @@ rgd = blueprints.ResourcegraphdefinitionBlueprint {
         }
         {
             id = "cluster"
+            # Without this, the claim reports Ready while the cluster is still
+            # CREATING in AWS — the instance's status doesn't reflect reality.
+            readyWhen = [r"""${cluster.status.status == "ACTIVE"}"""]
             template = {
                 apiVersion = "eks.services.k8s.aws/v1alpha1"
                 kind = "Cluster"
@@ -138,6 +145,7 @@ rgd = blueprints.ResourcegraphdefinitionBlueprint {
         }
         {
             id = "nodegroup"
+            readyWhen = [r"""${nodegroup.status.status == "ACTIVE"}"""]
             template = {
                 apiVersion = "eks.services.k8s.aws/v1alpha1"
                 kind = "Nodegroup"

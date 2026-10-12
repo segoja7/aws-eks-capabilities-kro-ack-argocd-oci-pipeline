@@ -93,12 +93,19 @@ phases:
         # Only after the gate passes: pull the library and render.
         (cd platform/apis && kcl mod add "oci://$ECR_REGISTRY/$ECR_NAMESPACE/blueprints" --tag "$BP_VER")
       - mkdir -p rendered/layer-1 rendered/apps
-      # platform/apis = the RGDs (pulls blueprints from ECR). 
+      # platform/apis = the RGDs (pulls blueprints from ECR).
       - (cd platform/apis && kcl run -S items -q) > rendered/layer-1/manifests.yaml
       - |
         for f in platform/gitops/apps/*.yaml; do
-          envsubst '$MANIFESTS_REPO $MANIFESTS_TAG $CLAIMS_REPO_URL' < "$f" > "rendered/apps/$(basename "$f")"
+          envsubst '$MANIFESTS_REPO $MANIFESTS_TAG $CLAIMS_REPO_URL $CLAIMS_BRANCH $PLATFORM_REPO_URL $PLATFORM_BRANCH' < "$f" > "rendered/apps/$(basename "$f")"
         done
+      # Frontier 2's PreSync hook: bundled INSIDE rendered/layer-1 (same dir
+      # layer-1-rgds.yaml's Application watches), so the artifact carries its own
+      # verifier.
+      - |
+        envsubst '$ECR_REGISTRY $MANIFESTS_REPO $MANIFESTS_TAG $SIGNING_PROFILE_ARN' \
+          < platform/gitops/hooks/verify-manifests-hook.yaml \
+          > rendered/layer-1/verify-manifests-hook.yaml
       - echo "rendered:" && wc -l rendered/layer-1/manifests.yaml && ls rendered/apps
   post_build:
     commands:
@@ -113,3 +120,40 @@ phases:
         oras push --disable-path-validation "$MANIFESTS_REPO:$MANIFESTS_TAG" "/tmp/manifests.tar.gz:$MT"
         oras push --disable-path-validation "$MANIFESTS_REPO:$SHA"           "/tmp/manifests.tar.gz:$MT"
         echo "pushed $MANIFESTS_REPO tags: $MANIFESTS_TAG, $SHA"
+      # Promotion: pin layer-1-rgds to THIS build's exact digest, via a PR — never a
+      # direct commit to main. The digest is the one just pushed above, so no TOCTOU
+      # between "what we promote" and "what's in the registry".
+      - |
+        set -e
+        PINNED_DIGEST=$(aws ecr describe-images --repository-name "$ECR_NAMESPACE/manifests" \
+          --image-ids imageTag="$SHA" --region "$AWS_REGION" --query 'imageDetails[0].imageDigest' --output text)
+        echo "promoting layer-1-rgds to $PINNED_DIGEST"
+        export MANIFESTS_REPO PINNED_DIGEST
+        envsubst '$MANIFESTS_REPO $PINNED_DIGEST' \
+          < platform/gitops/apps-pinned-template/layer-1-rgds.yaml \
+          > /tmp/layer-1-rgds.pinned.yaml
+      - |
+        set -e
+        rm -rf /tmp/promote-repo
+        # Credentials have to be configured BEFORE the clone — it's the clone itself
+        # that needs them, not anything after it.
+        git config --global credential.helper '!aws codecommit credential-helper $@'
+        git config --global credential.UseHttpPath true
+        git clone "$PLATFORM_REPO_URL" /tmp/promote-repo
+        cd /tmp/promote-repo
+        git config user.email "pipeline@base-eks.local"
+        git config user.name "base-eks-pipeline"
+        BRANCH="promote/$SHA"
+        git checkout -b "$BRANCH"
+        cp /tmp/layer-1-rgds.pinned.yaml platform/gitops/apps-pinned/layer-1-rgds.yaml
+        if git diff --quiet; then
+          echo "pinned digest unchanged, nothing to promote"
+        else
+          git add platform/gitops/apps-pinned/layer-1-rgds.yaml
+          git commit -m "promote: layer-1-rgds to manifests@$PINNED_DIGEST ($SHA)"
+          git push origin "$BRANCH"
+          aws codecommit create-pull-request --region "$AWS_REGION" \
+            --title "promote: layer-1-rgds to $SHA" \
+            --description "Pins layer-1-rgds to manifests@$PINNED_DIGEST, built and signature-verified from commit $SHA. Requires platform-approver to approve before merge." \
+            --targets "repositoryName=$(basename "$PLATFORM_REPO_URL"),sourceReference=$BRANCH,destinationReference=main"
+        fi
